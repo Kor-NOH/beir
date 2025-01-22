@@ -1,55 +1,80 @@
-from transformers import DPRContextEncoder, DPRContextEncoderTokenizerFast
-from transformers import DPRQuestionEncoder, DPRQuestionEncoderTokenizerFast
-from typing import Union, List, Dict, Tuple
-from tqdm.autonotebook import trange
-import torch
+import json
+import pandas as pd
+from torch.utils.data import DataLoader
+from transformers import AdamW
 
-class DPR:
-    def __init__(self, model_path: Union[str, Tuple] = None, **kwargs):
-        # DPR 모델과 토크나이저를 로드하고 설정
 
-        # 쿼리 인코더의 토크나이저 및 모델 초기화
-        self.q_tokenizer = DPRQuestionEncoderTokenizerFast.from_pretrained(model_path[0])
-        self.q_model = DPRQuestionEncoder.from_pretrained(model_path[0])
-        self.q_model.cuda()
-        self.q_model.eval()
+class BEIRDataset:
+    def __init__(self, corpus_file: str, queries_file: str, qrels_file: str):
+        # 코퍼스, 쿼리, Qrels 데이터를 로드합니다.
+        with open(corpus_file, 'r', encoding='utf-8') as f:
+            self.corpus = [json.loads(line) for line in f]
 
-        # 컨텍스트 인코더의 토크나이저 및 모델 초기화
-        self.ctx_tokenizer = DPRContextEncoderTokenizerFast.from_pretrained(model_path[1])
-        self.ctx_model = DPRContextEncoder.from_pretrained(model_path[1])
-        self.ctx_model.cuda()
-        self.ctx_model.eval()
+        with open(queries_file, 'r', encoding='utf-8') as f:
+            self.queries = json.load(f)
 
-    def encode_queries(self, queries: List[str], batch_size: int = 16, **kwargs) -> torch.Tensor:
-        # 쿼리를 벡터로 인코딩
+        self.qrels = pd.read_csv(qrels_file, sep='\t', names=['query_id', 'corpus_id', 'score'])
 
-        query_embeddings = []   # 결과를 저장할 리스트
-        with torch.no_grad():   # 파라미터 업데이터 비활성화
-            for start_idx in trange(0, len(queries), batch_size):   # 배치 단위로 처리
-                # 현재 배치의 질문을 토큰화
-                encoded = self.q_tokenizer(queries[start_idx:start_idx+batch_size], truncation=True, padding=True, return_tensors='pt')
+    def get_training_data(self):
+        # Qrels 기반으로 쿼리-문서 쌍 생성
+        query_doc_pairs = []
+        for _, row in self.qrels.iterrows():
+            query = self.queries[row['query_id']]
+            doc = next(item for item in self.corpus if item['_id'] == row['corpus_id'])
+            query_doc_pairs.append((query, doc))
+        return query_doc_pairs
 
-                # 토큰화된 질문을 모델에 입력해 벡터 계산
-                model_out = self.q_model(encoded['input_ids'].cuda(), attention_mask=encoded['attention_mask'].cuda())
-                query_embeddings += model_out.pooler_output # 결과를 리스트에 추가
 
-        return torch.stack(query_embeddings)    # 리스트를 텐서로 변환해 반환
+# BEIR 데이터 로드
+beir_data = BEIRDataset(
+    corpus_file='KorQuAD-corpus.jsonl',
+    queries_file='KorQuAD-queries.jsonl',
+    qrels_file='qrels-train.tsv'
+)
 
-    def encode_corpus(self, corpus: List[Dict[str, str]], batch_size: int = 8, **kwargs) -> torch.Tensor:
-        # 문서(corpus)를 벡터로 인코딩
+training_data = beir_data.get_training_data()
 
-        corpus_embeddings = []  # 결과를 저장할 리스트
-        with torch.no_grad():   # 파라미터 업데이트 비활성화
-            for start_idx in trange(0, len(corpus), batch_size):    # 배치 단위로 처리
-                # 현재 배치의 제목과 본문 추출
-                titles = [row['title'] for row in corpus[start_idx:start_idx+batch_size]]
-                texts = [row['text']  for row in corpus[start_idx:start_idx+batch_size]]
+# 모델 초기화
+dpr = DPR(model_path=("facebook/dpr-question_encoder-single-nq-base",
+                      "facebook/dpr-ctx_encoder-single-nq-base"))
 
-                # 제목과 본문을 함께 토큰화
-                encoded = self.ctx_tokenizer(titles, texts, truncation='longest_first', padding=True, return_tensors='pt')
 
-                # 토큰화된 문서를 모델에 입력해 벡터 계산
-                model_out = self.ctx_model(encoded['input_ids'].cuda(), attention_mask=encoded['attention_mask'].cuda())
-                corpus_embeddings += model_out.pooler_output.detach()   # 결과를 리스트에 추가
+# 데이터 준비
+def collate_fn(batch):
+    queries, documents = zip(*batch)
+    return queries, [{'title': doc.get('title', ''), 'text': doc['text']} for doc in documents]
 
-        return torch.stack(corpus_embeddings)   # 리스트를 텐서로 변환해 반환
+
+train_loader = DataLoader(training_data, batch_size=16, shuffle=True, collate_fn=collate_fn)
+
+# 옵티마이저 설정
+optimizer = AdamW(list(dpr.q_model.parameters()) + list(dpr.ctx_model.parameters()), lr=1e-5)
+
+# 학습 루프
+epochs = 3
+for epoch in range(epochs):
+    dpr.q_model.train()
+    dpr.ctx_model.train()
+
+    for batch in train_loader:
+        queries, documents = batch
+
+        # 쿼리와 문서 벡터 계산
+        query_embeddings = dpr.encode_queries(queries)
+        doc_embeddings = dpr.encode_corpus(documents)
+
+        # 코사인 유사도를 계산하여 손실 함수 정의
+        scores = torch.matmul(query_embeddings, doc_embeddings.T)
+        labels = torch.arange(scores.size(0)).cuda()
+        loss = torch.nn.CrossEntropyLoss()(scores, labels)
+
+        # 역전파 및 파라미터 업데이트
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Epoch {epoch + 1}/{epochs}, Loss: {loss.item():.4f}")
+
+# 학습 완료 후 저장
+dpr.q_model.save_pretrained("output/question_encoder")
+dpr.ctx_model.save_pretrained("output/context_encoder")
